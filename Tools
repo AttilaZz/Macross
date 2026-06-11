@@ -1,0 +1,38 @@
+def extract_campaigns(date: str, start_date_override: str = None) -> pd.DataFrame:
+    url = API_URL + "/mailing/campaigns/v1/campaign"
+
+    if start_date_override:
+        start_date = start_date_override
+    else:
+        start_date = datetime.strptime(date, "%Y-%m-%d").date() - relativedelta(months=1)
+        start_date = start_date.strftime("%Y-%m-%d")
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {get_auth_token()}",  # replace with your actual token
+    }
+
+    params = {
+        "$filter": f"campaignStartDate ge {start_date} and campaignStartDate lt {date}"
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        params=params,
+    )
+
+    response.raise_for_status()
+    return pd.DataFrame(response.json().get("value"))
+
+
+def extract_from_api(date: str, start_date_override: str = None):
+    logger.info("extracting campaigns")
+    campaigns = extract_campaigns(date=date, start_date_override=start_date_override)
+    if campaigns.empty:
+        return {
+            # ... inchangé
+        }
+
+    # ... reste inchangé jusqu'à la fin
