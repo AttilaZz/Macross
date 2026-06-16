@@ -1,0 +1,12 @@
+from airflow.models.param import Param
+
+@dag(
+    dag_id=dag_id,
+    default_args=default_args,
+    catchup=False,
+    schedule=schedule,
+    params={
+        "start_date": Param(type="string", description="Date de début (YYYY-MM-DD)"),
+        "end_date": Param(type="string", description="Date de fin (YYYY-MM-DD)"),
+    } if backfill_mode else {},
+)
