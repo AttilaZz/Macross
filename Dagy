@@ -1,0 +1,107 @@
+import io
+
+import pandas as pd
+from airflow.sdk import dag, task, TaskGroup
+from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from shared_tools.tools import default_args
+
+from etl_eloqua.utils.constants import config
+from etl_eloqua.utils.tools import (
+    extract_from_api,
+    upload_df_to_gcs,
+)
+
+
+def create_dag(dag_id, schedule, backfill_mode=False):
+
+    @dag(
+        dag_id=dag_id,
+        default_args=default_args,
+        catchup=False,
+        schedule=schedule,
+    )
+    def eloqua_dag():
+        data_interval_end = "{{ data_interval_end.date().isoformat() }}"
+
+        if backfill_mode:
+            effective_date = "{{ dag_run.conf['start_date'] }}"
+        else:
+            effective_date = "{{ dag_run.conf['start_date'] if dag_run.conf and 'start_date' in dag_run.conf else data_interval_end.date().isoformat() }}"
+
+        @task(task_id="extract_from_api", multiple_outputs=True)
+        def task_extract_from_api(date, **context):
+            """Extract data from Eloqua API"""
+            conf = context["dag_run"].conf or {}
+            start_date = conf.get("start_date")
+            end_date = conf.get("end_date") or None
+
+            if backfill_mode:
+                if not start_date:
+                    raise ValueError("backfill mode requiert 'start_date' dans la conf")
+                if not end_date:
+                    raise ValueError("backfill mode requiert 'end_date' dans la conf")
+
+            return extract_from_api(date=date, start_date=start_date, end_date=end_date)
+
+        datas = task_extract_from_api(date=data_interval_end)
+
+        for name in config.tables:
+
+            @task(task_id=f"{name}_load_to_gcs")
+            def load_to_gcs(name: str, data: str, date: str):
+                upload_df_to_gcs(
+                    dataframe=pd.read_json(io.StringIO(data), orient="split"),
+                    project=config.project_id,
+                    lake_bucket=config.datalake_bucket,
+                    prefix=f"eloqua/api/{name}",
+                    file_name=f"{date}.csv",
+                )
+
+            if backfill_mode:
+                delete_query = f"""
+                    DELETE FROM `{config.project_id}.{config.dataset_id}.{config.tables.get(name)}`
+                    WHERE campaign_start_date >= '{{{{ dag_run.conf["start_date"] }}}}'
+                    AND campaign_start_date < '{{{{ dag_run.conf["end_date"] }}}}';
+                """
+                source_object = "eloqua/api/" + name + "/{{ dag_run.conf['start_date'] }}.csv"
+            else:
+                delete_query = f"""
+                    DELETE FROM `{config.project_id}.{config.dataset_id}.{config.tables.get(name)}`
+                    WHERE campaign_start_date >= '{{{{ dag_run.conf["start_date"] if dag_run.conf and "start_date" in dag_run.conf else (data_interval_end - macros.dateutil.relativedelta.relativedelta(months=1)).date().isoformat() }}}}'
+                    AND campaign_start_date < '{{{{ dag_run.conf["end_date"] if dag_run.conf and "end_date" in dag_run.conf else data_interval_end.date().isoformat() }}}}';
+                """
+                source_object = "eloqua/api/" + name + "/{{ dag_run.conf['start_date'] if dag_run.conf and 'start_date' in dag_run.conf else data_interval_end.date().isoformat() }}.csv"
+
+            with TaskGroup(f"{name}_load_to_bq") as load_group:
+                remove_existing_task = BigQueryInsertJobOperator(
+                    task_id=f"{name}_remove_existing",
+                    configuration={
+                        "query": {
+                            "query": delete_query,
+                            "useLegacySql": False,
+                        }
+                    },
+                )
+
+                load_to_bq_task = GCSToBigQueryOperator(
+                    task_id=f"{name}_gcs_to_bigquery",
+                    bucket=config.datalake_bucket,
+                    source_objects=[source_object],
+                    source_format="csv",
+                    destination_project_dataset_table=f"{config.project_id}.{config.dataset_id}.{config.tables.get(name)}",
+                    skip_leading_rows=1,
+                    write_disposition="WRITE_APPEND",
+                    autodetect=False,
+                    schema_fields=config.schema.get(name),
+                )
+
+                remove_existing_task >> load_to_bq_task
+
+            load_to_gcs(name=name, data=datas[name], date=effective_date) >> load_group
+
+    return eloqua_dag()
+
+
+dag = create_dag("etl_eloqua", "45 3 1 * *")
+dag_backfill = create_dag("etl_eloqua_backfill", None, True)
