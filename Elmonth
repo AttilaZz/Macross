@@ -1,3 +1,13 @@
+if backfill_mode:
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    delta = relativedelta(end_dt, start_dt)
+    nb_mois = delta.months + delta.years * 12
+    
+    if nb_mois < 1:
+        raise ValueError(f"La plage doit être d'au moins 1 mois, reçu: {start_date} → {end_date}")
+
+
 campaigns_metrics = filter_aggregate(
     campaigns=campaigns,
     emails=emails,
