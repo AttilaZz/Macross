@@ -1,0 +1,22 @@
+campaigns_metrics = filter_aggregate(
+    campaigns=campaigns,
+    emails=emails,
+    date=date,
+    start_date=start_date,
+    end_date=end_date,
+)
+
+
+
+from dateutil.relativedelta import relativedelta
+
+if start_date and end_date:
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    delta = relativedelta(end_dt, start_dt)
+    nb_mois = max(delta.months + delta.years * 12, 1)
+else:
+    nb_mois = 1
+
+mask &= campaigns_metrics.totalSends > 50 * nb_mois
+mask &= (campaigns_metrics.isOpened / campaigns_metrics.totalDelivered) <= 100 * nb_mois
