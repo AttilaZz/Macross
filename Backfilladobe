@@ -1,3 +1,16 @@
+# Extraire les dates distinctes
+    csv_content = gcs_hook.download(
+        bucket_name=src_bucket,
+        object_name=final_csv_path,
+    )
+    df = pd.read_csv(io.BytesIO(csv_content))
+    dates = df['date'].drop_duplicates().tolist()
+    logging.info(f"Dates distinctes trouvées: {dates}")
+    return dates
+
+else:
+    raise ValueError(f"File doesn't exist or type is not supported : {source_path}. Expected csv or zip")
+
 import io
 import json
 import logging
