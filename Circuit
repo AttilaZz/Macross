@@ -1,0 +1,162 @@
+import io
+import json
+import logging
+from airflow.sdk import DAG, TaskGroup, Param
+from airflow.decorators import task
+from shared_tools.tools import default_args
+from etl_adobe_datawarehouse.utils.constants import config
+from etl_adobe_datawarehouse.utils.tools import check_and_process_file
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from airflow.providers.standard.operators.python import PythonOperator
+from google.cloud import bigquery
+
+resource_folder = "/home/airflow/gcs/dags/etl_adobe_datawarehouse/resources"
+persistent_dir_path = "/home/airflow/gcs/data"
+project = config.project_id
+bucket = config.datalake_bucket
+dataset = config.landing_dataset
+adobe_dir = config.export_gcs_dir
+
+
+def create_dag(dag_id, schedule, backfill_mode=False):
+
+    with DAG(
+        dag_id,
+        default_args=default_args,
+        catchup=False,
+        description='Adobe datawarehouse files ingestion',
+        schedule=schedule,
+        params={
+            "account": Param(type="string", description="Nom du account", default=""),
+            "report_name": Param(type="string", description="Nom du report_name", default=""),
+            "filename": Param(type="string", description="Nom du fichier à rejouer (sans extension)"),
+        } if backfill_mode else {},
+    ) as dag:
+
+        for account in config.account_groups:
+            account_name = account["account"]
+
+            with TaskGroup(account_name) as account_group:
+
+                @task.short_circuit(task_id=f'{account_name}_should_run')
+                def should_run_account(account_name, **context):
+                    if not backfill_mode:
+                        return True
+                    conf = context["dag_run"].conf or {}
+                    target_account = conf.get("account", "")
+                    return not target_account or target_account == account_name
+
+                should_run_account_task = should_run_account(account_name=account_name)
+
+                for export in account["export_groups"]:
+                    site = export["site"]
+                    report_name = export["report_name"]
+                    frequency = export["frequency"]
+                    file_extension = export["current_extension"]
+                    filename = f"{account_name}_{site}_{frequency}_{report_name}"
+                    filename_visits_30sec = f"{filename}_visites_30sec"
+                    source_object_prefix = f"web_analytics/adobe/{site}/{account_name}_{site}_{frequency}_{report_name}"
+                    target_table_prefix = f"{project}.{dataset}.{account_name}_{site}_{frequency}_{report_name}"
+
+                    if backfill_mode:
+                        partition = "{{ dag_run.conf['filename'] }}"
+                    else:
+                        partition = "{{ macros.ds_format(macros.ds_add(ds, -1), '%Y-%m-%d', '%Y%m%d') }}"
+
+                    files = [filename, filename_visits_30sec] if account_name != "bnp_paribas_comgpe" else [filename]
+
+                    site_name = f"{site}_{report_name}"
+                    with TaskGroup(site_name) as extract_sites:
+
+                        @task.short_circuit(task_id=f'{report_name}_should_run')
+                        def should_run_report(report_name, **context):
+                            if not backfill_mode:
+                                return True
+                            conf = context["dag_run"].conf or {}
+                            target_report = conf.get("report_name", "")
+                            return not target_report or target_report == report_name
+
+                        should_run_report_task = should_run_report(report_name=report_name)
+
+                        for file in files:
+                            task_name = file.replace(f"{account_name}_{site}_", "")
+
+                            schema_prefix = f"{resource_folder}/schemas/{account_name}/"
+                            if file == filename:
+                                schema_path = schema_prefix + f"{site}_{frequency}_{report_name}.json"
+                            else:
+                                schema_path = schema_prefix + f"{frequency}_{report_name}_visites_30sec.json"
+
+                            try:
+                                with open(schema_path, "r") as f:
+                                    schema = f.read()
+                            except Exception as e:
+                                logging.error(f">>> Encountered issue while reading schema file: {e}")
+                                raise Exception
+
+                            prepare_csv = PythonOperator(
+                                task_id=f'{task_name}_prepare_csv',
+                                python_callable=check_and_process_file,
+                                op_kwargs={
+                                    "src_bucket": bucket,
+                                    "site": site,
+                                    "filename": file,
+                                    "date": partition,
+                                    "gcs_dir": adobe_dir
+                                },
+                            )
+
+                            if file == filename:
+                                source_object = [f"{source_object_prefix}_{partition}.csv"]
+                                target_dataset_table = f"{target_table_prefix}${partition}"
+                            else:
+                                source_object = [f"{source_object_prefix}_visites_30sec_{partition}.csv"]
+                                target_dataset_table = f"{target_table_prefix}_visites_30sec${partition}"
+
+                            if backfill_mode:
+                                @task(task_id=f'{task_name}_remove_existing')
+                                def remove_existing(target_table, prepare_task_id, **context):
+                                    dates = context['ti'].xcom_pull(task_ids=prepare_task_id)
+                                    if not dates:
+                                        logging.info("Aucune date à supprimer")
+                                        return
+                                    dates_str = ", ".join([f"'{d}'" for d in dates])
+                                    query = f"""
+                                        DELETE FROM `{target_table}`
+                                        WHERE date IN ({dates_str})
+                                    """
+                                    logging.info(f"DELETE query: {query}")
+                                    client = bigquery.Client(project=project)
+                                    client.query(query).result()
+                                    logging.info(f"Supprimé les dates: {dates}")
+
+                                remove_task = remove_existing(
+                                    target_table=target_dataset_table,
+                                    prepare_task_id=f'{task_name}_prepare_csv'
+                                )
+
+                            gcs_to_bigquery = GCSToBigQueryOperator(
+                                task_id=f'{task_name}_gcs_to_bigquery',
+                                bucket=bucket,
+                                source_objects=source_object,
+                                source_format="csv",
+                                destination_project_dataset_table=target_dataset_table,
+                                skip_leading_rows=1,
+                                allow_jagged_rows=True,
+                                write_disposition='WRITE_APPEND' if backfill_mode else 'WRITE_TRUNCATE',
+                                time_partitioning=None if backfill_mode else {"type": "DAY"},
+                                schema_fields=json.loads(schema)
+                            )
+
+                            if backfill_mode:
+                                should_run_report_task >> prepare_csv >> remove_task >> gcs_to_bigquery
+                            else:
+                                should_run_report_task >> prepare_csv >> gcs_to_bigquery
+
+                should_run_account_task >> extract_sites
+
+    return dag
+
+
+etl_adobe_dw_dag = create_dag("etl_adobe_datawarehouse", "45 2 * * *")
+etl_adobe_dw_backfill_dag = create_dag("etl_adobe_datawarehouse_backfill", None, True)
