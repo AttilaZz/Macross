@@ -1,0 +1,15 @@
+SRC="gs://PROD_BUCKET/web_analytics/adobe"
+DST="gs://data_lake-p07phw7a4ko5/web_analytics/adobe"   # adapte prod/dev
+
+# 1) lister les objets créés le 18/06/2026 (colonne date = 2e champ, en UTC)
+gsutil ls -l "$SRC/**" \
+  | awk '$2 ~ /^2026-06-18/ {print $3}' \
+  > /tmp/files_18juin.txt
+
+# 2) VÉRIFIER avant de copier
+cat /tmp/files_18juin.txt ; wc -l /tmp/files_18juin.txt
+
+# 3) copier en conservant l'arborescence (echonet/, wcm/, ...)
+while read -r f; do
+  gsutil cp "$f" "${f/$SRC/$DST}"
+done < /tmp/files_18juin.txt
