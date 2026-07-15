@@ -1,4 +1,13 @@
-from google.cloud import bigquery
+SELECT
+    ingestion_date,
+    eloqua_campaign_id,
+    campaign_name,
+    campaign_start_date,
+    COUNT(*) AS nb_doublons
+FROM `datalab-bnpp.dw_echonet_eloqua.eloqua_campaigns_metrics`
+GROUP BY ingestion_date, eloqua_campaign_id, campaign_name, campaign_start_date
+HAVING COUNT(*) > 1
+ORDER BY ingestion_date, nb_doublons DESCfrom google.cloud import bigquery
 
 client = bigquery.Client(project="datalab-bnpp-dev")
 TABLE = "datalab-bnpp.dw_echonet_eloqua.eloqua_campaigns_metrics"
