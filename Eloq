@@ -1,0 +1,54 @@
+from google.cloud import bigquery
+
+client = bigquery.Client(project="datalab-bnpp-dev")
+TABLE = "datalab-bnpp.dw_echonet_eloqua.eloqua_campaigns_metrics"
+
+# ------------------------------------------------------------------
+# PHASE 1 : AUDIT — min/max de campaign_start_date par ingestion_date
+# ------------------------------------------------------------------
+def audit():
+    query = f"""
+        SELECT
+            ingestion_date,
+            MIN(campaign_start_date) AS min_start,
+            MAX(campaign_start_date) AS max_start,
+            COUNT(*) AS nb_rows
+        FROM `{TABLE}`
+        GROUP BY ingestion_date
+        ORDER BY ingestion_date ASC
+    """
+    df = client.query(query).to_dataframe()
+    print(df.to_string(index=False))
+    return df
+
+# ------------------------------------------------------------------
+# PHASE 2 : APPLY — remappe les ingestion_date selon ta décision
+# À remplir manuellement après analyse de l'audit :
+#   ancienne_date -> nouvelle_date
+# ------------------------------------------------------------------
+MAPPING = {
+    # "2024-10-22": "2024-10-01",
+    # "2025-01-02": "2024-12-01",
+    # "2025-01-09": "2025-01-01",
+}
+
+def apply_mapping(dry_run=True):
+    for old_date, new_date in MAPPING.items():
+        query = f"""
+            UPDATE `{TABLE}`
+            SET ingestion_date = DATE('{new_date}')
+            WHERE ingestion_date = DATE('{old_date}')
+        """
+        if dry_run:
+            print(f"[DRY RUN] {old_date} -> {new_date}")
+            print(query)
+        else:
+            job = client.query(query)
+            job.result()
+            print(f"[OK] {old_date} -> {new_date} : {job.num_dml_affected_rows} lignes modifiées")
+
+if __name__ == "__main__":
+    audit()
+    # Une fois le MAPPING rempli :
+    # apply_mapping(dry_run=True)   # vérifier les requêtes
+    # apply_mapping(dry_run=False)  # exécuter réellement
