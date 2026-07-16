@@ -1,0 +1,47 @@
+import csv
+from datetime import datetime
+
+FILE = "/chemin/vers/bnp_paribas_comgpe_echonet_daily_echonet_social_20260713.csv"
+DATE_COL_INDEX = 11
+MAX_ERRORS = 10
+
+def parse_date_like_bq(value):
+    """BigQuery DATE n'accepte que YYYY-MM-DD."""
+    datetime.strptime(value.strip(), "%Y-%m-%d")
+
+def diagnose(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        nb_cols_header = len(header)
+        print(f"Header : {nb_cols_header} colonnes")
+        print(f"Colonne index {DATE_COL_INDEX} : '{header[DATE_COL_INDEX]}'\n")
+
+        errors = 0
+        for line_number, row in enumerate(reader, start=2):
+            if len(row) != nb_cols_header:
+                print(f"[ligne {line_number}] DECALAGE : {len(row)} colonnes au lieu de {nb_cols_header}")
+                print(f"    debut de ligne : {row[:5]}")
+                errors += 1
+            else:
+                value = row[DATE_COL_INDEX]
+                try:
+                    parse_date_like_bq(value)
+                except ValueError:
+                    print(f"[ligne {line_number}] DATE INVALIDE : '{value}'")
+                    candidates = [
+                        (i, header[i], v) for i, v in enumerate(row)
+                        if len(v) == 10 and v[4:5] in "-/" and v[:4].isdigit()
+                    ]
+                    print(f"    colonnes contenant des dates : {candidates}")
+                    errors += 1
+
+            if errors >= MAX_ERRORS:
+                print(f"\nArrêt après {MAX_ERRORS} erreurs.")
+                return
+
+        if errors == 0:
+            print("✔ Aucune erreur : ce fichier passerait le load BQ.")
+
+if __name__ == "__main__":
+    diagnose(FILE)
