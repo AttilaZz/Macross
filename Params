@@ -1,3 +1,9 @@
+# Pas de re-download : on a déjà les bytes en mémoire
+dates = set()
+for chunk in pd.read_csv(io.BytesIO(csv_bytes), usecols=["Date"], dtype=str, chunksize=500_000):
+    dates.update(chunk["Date"].unique())
+dates = sorted(dates)
+
 from airflow.models.param import Param
 
 @dag(
