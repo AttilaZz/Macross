@@ -1,0 +1,147 @@
+"""
+Découpe un gros CSV (zippé/gzippé) stocké sur GCS en fichiers par fenêtres de N mois
+(défaut 3, --window-months 1 pour du mensuel), ancrées sur aujourd'hui en remontant.
+Chaque fenêtre est réécrite sur GCS en CSV brut.
+
+Fonctionnement : lecture en streaming par chunks pandas -> jamais tout le fichier en RAM.
+Écriture en streaming directement sur GCS (pas de disque local requis).
+
+Usage :
+    python split_gcs_csv_by_quarter.py \
+        --input gs://mon-bucket/path/gros_fichier.csv.zip \
+        --output-prefix gs://mon-bucket/path/split/ \
+        --date-col "Date" \
+        --date-format "%B %d, %Y" \
+        --window-months 1
+
+Dépendances : pip install pandas gcsfs
+"""
+
+import argparse
+import gzip
+import io
+import zipfile
+
+import gcsfs
+import numpy as np
+import pandas as pd
+
+CHUNKSIZE = 200_000  # lignes par chunk, à ajuster selon la RAM
+
+
+def build_windows(
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    months: int = 3,
+    days: int | None = None,
+) -> pd.DatetimeIndex:
+    """Construit les bornes de fenêtres en remontant depuis end_date jusqu'à couvrir
+    start_date. Si `days` est fourni, fenêtres de N jours ; sinon fenêtres de `months` mois.
+    Retourne les bornes triées croissantes."""
+    step = pd.Timedelta(days=days) if days else pd.DateOffset(months=months)
+    bounds = [end_date]
+    cur = end_date
+    while cur > start_date:
+        cur = cur - step
+        bounds.append(cur)
+    return pd.DatetimeIndex(sorted(bounds))
+
+
+def open_input_stream(fs: gcsfs.GCSFileSystem, path: str):
+    """Retourne un flux texte sur le CSV. Supporte gs:// et chemins locaux,
+    que le fichier soit .zip, .gz ou .csv brut."""
+    raw = fs.open(path, "rb") if path.startswith("gs://") else open(path, "rb")
+    if path.endswith(".zip"):
+        zf = zipfile.ZipFile(raw)
+        inner_name = zf.namelist()[0]  # on suppose 1 seul CSV dans le zip
+        print(f"Fichier interne du zip : {inner_name}")
+        return io.TextIOWrapper(zf.open(inner_name), encoding="utf-8")
+    if path.endswith(".gz"):
+        return io.TextIOWrapper(gzip.GzipFile(fileobj=raw), encoding="utf-8")
+    return io.TextIOWrapper(raw, encoding="utf-8")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, help="gs://bucket/path/fichier.csv.zip")
+    parser.add_argument("--output-prefix", required=True, help="gs://bucket/path/split/")
+    parser.add_argument("--date-col", required=True, help="Nom de la colonne date")
+    parser.add_argument("--sep", default=",", help="Séparateur CSV (défaut ,)")
+    parser.add_argument("--date-format", default=None, help="Format date optionnel, ex %%Y-%%m-%%d")
+    parser.add_argument("--start", default="2025-01-01", help="Date min couverte (défaut 2025-01-01)")
+    parser.add_argument("--end", default=None, help="Date max / ancre des fenêtres (défaut aujourd'hui)")
+    parser.add_argument("--window-months", type=int, default=3, help="Taille des fenêtres en mois (défaut 3)")
+    parser.add_argument("--window-days", type=int, default=None,
+                        help="Taille des fenêtres en jours (prioritaire sur --window-months si fourni)")
+    parser.add_argument("--name-prefix", default="",
+                        help="Préfixe ajouté au nom des fichiers de sortie, ex 'echonet_videos_'")
+    args = parser.parse_args()
+
+    fs = gcsfs.GCSFileSystem(session_kwargs={"trust_env": True})
+    output_prefix = args.output_prefix.rstrip("/")
+
+    start_date = pd.Timestamp(args.start)
+    end_date = pd.Timestamp(args.end) if args.end else pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
+    bounds = build_windows(start_date, end_date, args.window_months, args.window_days)
+    labels = [
+        f"{bounds[i].date()}_{(bounds[i + 1] - pd.Timedelta(days=1)).date()}"
+        for i in range(len(bounds) - 1)
+    ]
+    window_desc = f"{args.window_days} jours" if args.window_days else f"{args.window_months} mois"
+    print(f"Fenêtres de {window_desc} (depuis l'ancre en remontant) :")
+    for lb in labels:
+        print(f"  - {lb}")
+
+    # writers ouverts par fenêtre : {"2026-06-22_2026-07-21": fichier GCS}
+    writers: dict[str, object] = {}
+
+    def get_writer(period: str):
+        if period not in writers:
+            out_path = f"{output_prefix}/{args.name_prefix}{period}.csv"
+            print(f"Ouverture writer -> {out_path}")
+            writers[period] = fs.open(out_path, "wb")
+        return writers[period]
+
+    headers_written: set[str] = set()
+    total_rows = 0
+
+    stream = open_input_stream(fs, args.input)
+    reader = pd.read_csv(stream, sep=args.sep, chunksize=CHUNKSIZE, dtype=str)
+
+    for i, chunk in enumerate(reader):
+        dates = pd.to_datetime(chunk[args.date_col], format=args.date_format, errors="coerce")
+        n_bad = dates.isna().sum()
+        if n_bad:
+            print(f"  ATTENTION : {n_bad} lignes avec date invalide dans le chunk {i} (ignorées)")
+            chunk = chunk[dates.notna()]
+            dates = dates[dates.notna()]
+
+        # affectation de chaque ligne à sa fenêtre de 3 mois
+        idx = np.searchsorted(bounds.values, dates.values, side="right") - 1
+        in_range = (idx >= 0) & (idx < len(labels))
+        n_out = (~in_range).sum()
+        if n_out:
+            print(f"  {n_out} lignes hors plage [{start_date.date()} ; {end_date.date()}[ ignorées (chunk {i})")
+        chunk = chunk[in_range]
+        periods = pd.Series(idx[in_range], index=chunk.index).map(lambda k: labels[k])
+
+        for period, sub in chunk.groupby(periods):
+            w = get_writer(period)
+            buf = io.StringIO()
+            sub.to_csv(buf, sep=args.sep, index=False, header=period not in headers_written)
+            headers_written.add(period)
+            w.write(buf.getvalue().encode("utf-8"))
+
+        total_rows += len(chunk)
+        print(f"Chunk {i} traité — {total_rows:,} lignes cumulées")
+
+    # fermeture propre : flush du fichier GCS
+    for period in writers:
+        writers[period].close()
+        print(f"Finalisé : {output_prefix}/{args.name_prefix}{period}.csv")
+
+    print(f"Terminé. {total_rows:,} lignes réparties sur {len(writers)} fichiers.")
+
+
+if __name__ == "__main__":
+    main()
